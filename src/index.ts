@@ -4,11 +4,11 @@ import { existsSync, promises as fspromises } from 'fs';
 import { CONFIG } from './config';
 import { doesFileHaveExifDate } from './helpers/does-file-have-exif-date';
 import { findSupportedMediaFiles } from './helpers/find-supported-media-files';
-import { readPhotoTakenTimeFromGoogleJson } from './helpers/read-photo-taken-time-from-google-json';
+import { readMetadataFromGoogleJson } from './helpers/read-metadata-from-google-json';
 import { updateExifMetadata } from './helpers/update-exif-metadata';
 import { updateFileModificationDate } from './helpers/update-file-modification-date';
 import { Directories } from './models/directories'
-
+import { isFromGooglePartnerSharing } from './helpers/is-from-google-partner-sharing';
 const { readdir, mkdir, copyFile } = fspromises;
 
 class GooglePhotosExif extends Command {
@@ -32,18 +32,21 @@ class GooglePhotosExif extends Command {
       description: 'Directory for any files that have bad EXIF data - including the matching metadata files',
       required: true,
     }),
+    excludePartnerSharingMedia: flags.boolean({
+      description: 'Include this parameter if you do not want the output to contain media that was saved from partner sharing in google phots'
+    }),
   }
 
   static args: Parser.args.Input  = []
 
   async run() {
     const { args, flags} = this.parse(GooglePhotosExif);
-    const { inputDir, outputDir, errorDir } = flags;
+    const { inputDir, outputDir, errorDir, excludePartnerSharingMedia } = flags;
 
     try {
       const directories = this.determineDirectoryPaths(inputDir, outputDir, errorDir);
       await this.prepareDirectories(directories);
-      await this.processMediaFiles(directories);
+      await this.processMediaFiles(directories, excludePartnerSharingMedia);
     } catch (error) {
       this.error(error);
       this.exit(1);
@@ -93,11 +96,12 @@ class GooglePhotosExif extends Command {
     }
   }
 
-  private async processMediaFiles(directories: Directories): Promise<void> {
+  private async processMediaFiles(directories: Directories, excludePartnerSharingMedia: boolean): Promise<void> {
     // Find media files
     const supportedMediaFileExtensions = CONFIG.supportedMediaFileTypes.map(fileType => fileType.extension);
     this.log(`--- Finding supported media files (${supportedMediaFileExtensions.join(', ')}) ---`)
     const mediaFiles = await findSupportedMediaFiles(directories.input, directories.output);
+    let partnerSharedFiles = 0;
 
     // Count how many files were found for each supported file extension
     const mediaFileCountsByExtension = new Map<string, number>();
@@ -114,26 +118,41 @@ class GooglePhotosExif extends Command {
     this.log(`--- Processing media files ---`);
     const fileNamesWithEditedExif: string[] = [];
 
+    if (excludePartnerSharingMedia) {
+      this.log(`-## Partner shared media will be excluded ##-`);
+    }
+
     for (let i = 0, mediaFile; mediaFile = mediaFiles[i]; i++) {
+
+      if (excludePartnerSharingMedia) {
+        const fromPartnerSharing = await isFromGooglePartnerSharing(mediaFile);
+        if (fromPartnerSharing) {
+          partnerSharedFiles++;
+          this.log(`Skipping file ${i} of ${mediaFiles.length} because it was partner shared: ${mediaFile.mediaFilePath}`);
+          continue;
+        }
+      }
 
       // Copy the file into output directory
       this.log(`Copying file ${i} of ${mediaFiles.length}: ${mediaFile.mediaFilePath} -> ${mediaFile.outputFileName}`);
       await copyFile(mediaFile.mediaFilePath, mediaFile.outputFilePath);
 
       // Process the output file, setting the modified timestamp and/or EXIF metadata where necessary
-      const photoTimeTaken = await readPhotoTakenTimeFromGoogleJson(mediaFile);
+      const [metadata, timeTaken] = await readMetadataFromGoogleJson(mediaFile);
 
-      if (photoTimeTaken) {
+      if (metadata) {
         if (mediaFile.supportsExif) {
           const hasExifDate = await doesFileHaveExifDate(mediaFile.mediaFilePath);
           if (!hasExifDate) {
-            await updateExifMetadata(mediaFile, photoTimeTaken, directories.error);
+            await updateExifMetadata(mediaFile, metadata, directories.error);
             fileNamesWithEditedExif.push(mediaFile.outputFileName);
             this.log(`Wrote "DateTimeOriginal" EXIF metadata to: ${mediaFile.outputFileName}`);
           }
         }
 
-        await updateFileModificationDate(mediaFile.outputFilePath, photoTimeTaken);
+        if (timeTaken) {
+          await updateFileModificationDate(mediaFile.outputFilePath, timeTaken);
+        }
       }
     }
 
@@ -142,6 +161,9 @@ class GooglePhotosExif extends Command {
     mediaFileCountsByExtension.forEach((count, extension) => {
       this.log(`${count} files with extension ${extension}`);
     });
+    if (excludePartnerSharingMedia) {
+      this.log(`--- ${partnerSharedFiles} partner shared files were excluded ---`);
+    }    
     this.log(`--- The file modified timestamp has been updated on all media files ---`)
     if (fileNamesWithEditedExif.length > 0) {
       this.log(`--- Found ${fileNamesWithEditedExif.length} files which support EXIF, but had no DateTimeOriginal field. For each of the following files, the DateTimeOriginalField has been updated using the date found in the JSON metadata: ---`);
